@@ -38,7 +38,7 @@ In the backend service's **Variables** tab, add these values:
 
 | Variable | Value |
 | --- | --- |
-| `ANTHROPIC_API_KEY` | Your Anthropic API key. It is reserved for the later real-grading implementation. |
+| `ANTHROPIC_API_KEY` | Your Anthropic API key, used for question generation and grading. |
 | `GATE_SECRET` | A new long random secret used by the `X-Gate-Secret` request header. |
 | `MODEL` | The model identifier you intend to use later. |
 | `DATABASE_URL` | The Postgres reference from step 4. |

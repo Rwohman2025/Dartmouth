@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "FastAPI backend for the Dartmouth gate"
 requires-python = ">=3.12"
 dependencies = [
+  "anthropic>=0.80.0",
   "fastapi>=0.115.0",
   "psycopg[binary]>=3.2.0",
   "python-dotenv>=1.0.1",

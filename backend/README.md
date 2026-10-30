@@ -1,8 +1,10 @@
 # Dartmouth backend
 
-This FastAPI service creates and stores proposals in SQLite, returns two fixed questions for each proposal, and uses a temporary grader: an answer passes when it contains more than 20 non-whitespace characters. `GET /check` always returns `{ "pass": true }` during this fake-data stage.
+This FastAPI service stores proposals in SQLite or PostgreSQL, generates questions through Anthropic, and grades answers against a private rubric. Questions and answers are sent to Anthropic with one-based line numbers added to the submitted code. `GET /check` remains a temporary always-pass endpoint.
 
 Every endpoint requires `X-Gate-Secret` to match `GATE_SECRET` in the repository-root `.env` file. The existing `.env` stays untracked. See `.env.example` for the supported settings.
+
+Set both `ANTHROPIC_API_KEY` and `MODEL` in the repository-root `.env` file before creating or grading proposals. Edit `prompts/generate.txt` and `prompts/grade.txt` to change the model instructions without changing Python code. Rubrics are stored in the database and are never returned by API routes.
 
 ## Run locally
 
@@ -19,6 +21,12 @@ To run the checks:
 
 ```powershell
 python -m uv run pytest
+```
+
+Run the Anthropic evaluation over `demo/snippets` and `demo/ANSWER_KEY.md` with:
+
+```powershell
+python -m uv run python eval.py
 ```
 
 For a Railway deployment with PostgreSQL, see [DEPLOY.md](DEPLOY.md).
