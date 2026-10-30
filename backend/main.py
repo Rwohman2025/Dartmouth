@@ -15,7 +15,7 @@ from anthropic import APIError, Anthropic
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text, create_engine, select
+from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text, create_engine, inspect, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
 
@@ -50,6 +50,7 @@ class Proposal(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     repository: Mapped[str] = mapped_column(String(255))
+    file_path: Mapped[str | None] = mapped_column(String(1024), nullable=True, index=True)
     commit_sha: Mapped[str] = mapped_column(String(128))
     diff: Mapped[str] = mapped_column(Text)
     summary: Mapped[str] = mapped_column(Text)
@@ -87,6 +88,7 @@ class Attempt(Base):
 
 class ProposalInput(BaseModel):
     repository: str = Field(min_length=1)
+    file_path: str | None = Field(default=None, min_length=1)
     commit_sha: str = Field(min_length=1)
     diff: str = Field(min_length=1)
     summary: str = Field(min_length=1)
@@ -106,12 +108,25 @@ class StrictModel(BaseModel):
 
 
 class GeneratedQuestion(StrictModel):
-    prompt: str = Field(min_length=1)
+    id: str = Field(min_length=1)
+    line_start: int = Field(ge=1)
+    line_end: int = Field(ge=1)
+    question: str = Field(min_length=1)
     rubric: str = Field(min_length=1)
+
+    @property
+    def prompt(self) -> str:
+        """Compatibility name for storage and grading code."""
+        return self.question
 
 
 class GeneratedQuestions(StrictModel):
-    questions: list[GeneratedQuestion] = Field(min_length=1, max_length=1)
+    questions: list[GeneratedQuestion] = Field(min_length=1, max_length=3)
+
+
+class GradingQuestion(StrictModel):
+    prompt: str = Field(min_length=1)
+    rubric: str = Field(min_length=1)
 
 
 class ModelGradeResponse(StrictModel):
@@ -150,6 +165,55 @@ def add_line_numbers(code: str) -> str:
     return "\n".join(f"{line_number:04d} | {line}" for line_number, line in enumerate(code.splitlines(), start=1))
 
 
+def normalize_source_line(line: str) -> str:
+    """Ignore all whitespace so indentation-only changes still match."""
+    return "".join(line.split())
+
+
+def parse_added_lines(unified_diff: str) -> dict[str, set[str]]:
+    """Collect non-blank added lines by their repository-relative file path."""
+    added_by_file: dict[str, set[str]] = {}
+    current_path: str | None = None
+    for line in unified_diff.splitlines():
+        if line.startswith("+++ "):
+            candidate = line[4:].strip()
+            if candidate == "/dev/null":
+                current_path = None
+            elif candidate.startswith("b/"):
+                current_path = candidate[2:]
+                added_by_file.setdefault(current_path, set())
+            else:
+                current_path = candidate
+                added_by_file.setdefault(current_path, set())
+            continue
+        if current_path is None or not line.startswith("+") or line.startswith("+++"):
+            continue
+        normalized = normalize_source_line(line[1:])
+        if normalized:
+            added_by_file[current_path].add(normalized)
+    return added_by_file
+
+
+def proposal_match_ratio(proposal_code: str, added_lines: set[str]) -> float:
+    proposal_lines = [
+        normalized for raw_line in proposal_code.splitlines()
+        if (normalized := normalize_source_line(raw_line))
+    ]
+    if not proposal_lines:
+        return 0.0
+    matches = sum(line in added_lines for line in proposal_lines)
+    return matches / len(proposal_lines)
+
+
+def initialize_database() -> None:
+    """Create fresh tables and add the file-path column to pre-existing databases."""
+    Base.metadata.create_all(bind=engine)
+    columns = {column["name"] for column in inspect(engine).get_columns("proposals")}
+    if "file_path" not in columns:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE proposals ADD COLUMN file_path VARCHAR(1024)"))
+
+
 def load_prompt(name: str) -> str:
     try:
         return (PROMPTS_DIRECTORY / name).read_text(encoding="utf-8")
@@ -165,7 +229,7 @@ def _call_anthropic(system_prompt: str, user_content: str) -> str:
     try:
         response = Anthropic(api_key=api_key).messages.create(
             model=model,
-            max_tokens=1024,
+            max_tokens=2048,
             system=system_prompt,
             messages=[{"role": "user", "content": user_content}],
         )
@@ -207,7 +271,7 @@ def generate_questions(code: str) -> list[GeneratedQuestion]:
     return result.questions
 
 
-def grade_answer(code: str, question: GeneratedQuestion, answer: str) -> GradedAnswer:
+def grade_answer(code: str, question: GeneratedQuestion | GradingQuestion, answer: str) -> GradedAnswer:
     result = request_json(
         "grade.txt",
         "\n".join(
@@ -275,7 +339,7 @@ def model_http_error(error: Exception) -> HTTPException:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    Base.metadata.create_all(bind=engine)
+    initialize_database()
     yield
 
 
@@ -295,7 +359,8 @@ def create_proposal(payload: ProposalInput, session: Session = Depends(get_sessi
         raise model_http_error(error) from error
 
     proposal = Proposal(
-        id=str(uuid4()), repository=payload.repository, commit_sha=payload.commit_sha, diff=payload.diff,
+        id=str(uuid4()), repository=payload.repository, file_path=payload.file_path,
+        commit_sha=payload.commit_sha, diff=payload.diff,
         summary=payload.summary, status="pending", created_at=utc_now(),
     )
     session.add(proposal)
@@ -331,7 +396,11 @@ def grade_proposal(proposal_id: str, payload: GradeInput, session: Session = Dep
     attempts: list[Attempt] = []
     try:
         for question in questions:
-            decision = grade_answer(proposal.diff, GeneratedQuestion(prompt=question.prompt, rubric=question.rubric), answers_by_question[question.id])
+            decision = grade_answer(
+                proposal.diff,
+                GradingQuestion(prompt=question.prompt, rubric=question.rubric),
+                answers_by_question[question.id],
+            )
             attempt = Attempt(
                 id=str(uuid4()), proposal_id=proposal.id, question_id=question.id, answer=answers_by_question[question.id],
                 passed=decision.passed, feedback=decision.feedback, created_at=utc_now(),
@@ -372,7 +441,33 @@ def get_proposal(proposal_id: str, session: Session = Depends(get_session)) -> d
     }
 
 
-@app.get("/check")
-def check() -> dict[str, bool]:
-    """Temporary action-facing endpoint. It intentionally always passes."""
-    return {"pass": True}
+class CheckInput(BaseModel):
+    repo: str = Field(min_length=1)
+    diff: str = Field(min_length=1)
+
+
+@app.post("/check")
+def check(payload: CheckInput, session: Session = Depends(get_session)) -> dict[str, object]:
+    added_by_file = parse_added_lines(payload.diff)
+    unanswered: list[dict[str, str]] = []
+    backend_url = os.getenv("BACKEND_URL", "http://localhost:8000").rstrip("/")
+
+    for file_path, added_lines in added_by_file.items():
+        proposals = session.scalars(
+            select(Proposal).where(
+                Proposal.repository == payload.repo,
+                Proposal.file_path == file_path,
+                Proposal.status != "passed",
+            )
+        )
+        for proposal in proposals:
+            if proposal_match_ratio(proposal.diff, added_lines) >= 0.5:
+                unanswered.append(
+                    {
+                        "proposal_id": proposal.id,
+                        "file_path": file_path,
+                        "review_url": f"{backend_url}/review/{proposal.id}",
+                    }
+                )
+
+    return {"status": "fail" if unanswered else "pass", "unanswered": unanswered}
