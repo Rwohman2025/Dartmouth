@@ -1,0 +1,22 @@
+[project]
+name = "dartmouth-backend"
+version = "0.1.0"
+description = "FastAPI backend for the Dartmouth gate"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115.0",
+  "psycopg>=3.2.0",
+  "python-dotenv>=1.0.1",
+  "sqlalchemy>=2.0.36",
+  "uvicorn>=0.32.0",
+]
+
+[dependency-groups]
+dev = [
+  "httpx>=0.28.0",
+  "pytest>=8.3.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
