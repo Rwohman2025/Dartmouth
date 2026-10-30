@@ -1,0 +1,31 @@
+name: Dartmouth proposal gate
+description: Scaffold for verifying a backend approval against an exact Git revision
+inputs:
+  backend-url:
+    description: HTTPS backend URL reachable from the runner
+    required: true
+  proposal-id:
+    description: Existing proposal to verify
+    required: true
+  commit-sha:
+    description: Full Git revision the approval must cover
+    required: true
+outputs:
+  approved:
+    description: Will be true only after implemented verification succeeds
+runs:
+  using: composite
+  steps:
+    - name: Validate configuration and report scaffold status
+      shell: bash
+      env:
+        BACKEND_URL: ${{ inputs.backend-url }}
+        PROPOSAL_ID: ${{ inputs.proposal-id }}
+        COMMIT_SHA: ${{ inputs.commit-sha }}
+      run: |
+        if [[ -z "$BACKEND_URL" || -z "$PROPOSAL_ID" || -z "$COMMIT_SHA" ]]; then
+          echo '::error::backend-url, proposal-id, and commit-sha are required.'
+          exit 1
+        fi
+        echo '::error::Dartmouth Action is not implemented; no approval has been verified.'
+        exit 1
