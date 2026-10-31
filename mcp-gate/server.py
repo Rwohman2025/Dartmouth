@@ -8,6 +8,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from dotenv import load_dotenv
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.elicitation import AcceptedElicitation
@@ -19,6 +20,10 @@ from mcp.types import (
     InputRequiredResult,
 )
 from mcp_types.version import MODERN_PROTOCOL_VERSIONS
+
+# BACKEND_URL and GATE_SECRET come from the .env in the repo root. Real
+# environment variables win over the file (override=False).
+load_dotenv(Path(__file__).parent.parent / ".env")
 
 mcp = FastMCP("mcp-gate")
 
@@ -164,11 +169,8 @@ def _clear_pending(root: Path, rel: str) -> None:
             break
 
 
-def _fmt_lines(lines: list) -> str:
-    if not lines:
-        return ""
-    label = "line" if len(lines) == 1 else "lines"
-    return f"{label} {', '.join(str(n) for n in lines)}"
+def _fmt_range(start: int, end: int) -> str:
+    return f"line {start}" if start == end else f"lines {start}-{end}"
 
 
 # --- mock backend (demo/ANSWER_KEY.md) -------------------------------------
@@ -207,12 +209,13 @@ def _mock_snippet(rel: str) -> tuple[str, dict]:
 
 
 # --- backend calls ----------------------------------------------------------
-# CONTRACT.md is empty, so the request/response shapes below are ASSUMPTIONS.
-# They are confined to _create_proposal and _submit_answers; fix them there.
-#   POST /proposals          {repo, file_path, content, task}
-#                            -> {id, questions: [{id, text, lines: [int]}]}
-#   POST /proposals/{id}/answers  {answers: {question_id: text}}
-#                            -> {passed: bool, hints: [{question_id, text, lines}]}
+# Shapes follow CONTRACT.md and are confined to _create_proposal and
+# _submit_answers. Internally, answers are {question_id: text} and a hint is
+# {question_id, hint, hint_line}.
+#   POST /proposals               {repo, file_path, code, task}
+#                                 -> {proposal_id, questions: [{id, line_start, line_end, question}]}
+#   POST /proposals/{id}/answers  {answers: [{question_id, answer}]}
+#                                 -> {passed, results: [{question_id, passed, hint, hint_line}]}
 
 
 def _http_post(path: str, body: dict) -> dict:
@@ -225,7 +228,7 @@ def _http_post(path: str, body: dict) -> dict:
     req = urllib.request.Request(
         base.rstrip("/") + path,
         data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {secret}"},
+        headers={"Content-Type": "application/json", "X-Gate-Secret": secret},
         method="POST",
     )
     try:
@@ -242,14 +245,21 @@ async def _create_proposal(repo: str, rel: str, content: str, task: str) -> dict
         name, entry = _mock_snippet(rel)
         return {
             "id": f"mock-{name}",
-            "questions": [{"id": "q1", "text": entry["question"], "lines": [entry["line"]]}],
+            "questions": [
+                {
+                    "id": "q1",
+                    "line_start": entry["line"],
+                    "line_end": entry["line"],
+                    "question": entry["question"],
+                }
+            ],
         }
     data = await asyncio.to_thread(
         _http_post,
         "/proposals",
-        {"repo": repo, "file_path": rel, "content": content, "task": task},
+        {"repo": repo, "file_path": rel, "code": content, "task": task},
     )
-    return {"id": data["id"], "questions": data["questions"]}
+    return {"id": data["proposal_id"], "questions": data["questions"]}
 
 
 async def _submit_answers(state: dict, answers: dict) -> tuple[bool, list[dict]]:
@@ -262,11 +272,18 @@ async def _submit_answers(state: dict, answers: dict) -> tuple[bool, list[dict]]
             "Trace the exact input from the question through the code, one "
             "line at a time, before answering."
         )
-        return False, [{"question_id": "q1", "text": hint, "lines": [entry["line"]]}]
+        return False, [{"question_id": "q1", "hint": hint, "hint_line": entry["line"]}]
     data = await asyncio.to_thread(
-        _http_post, f"/proposals/{state['id']}/answers", {"answers": answers}
+        _http_post,
+        f"/proposals/{state['id']}/answers",
+        {"answers": [{"question_id": q, "answer": a} for q, a in answers.items()]},
     )
-    return bool(data["passed"]), data.get("hints") or []
+    hints = [
+        {"question_id": r["question_id"], "hint": r["hint"], "hint_line": r.get("hint_line")}
+        for r in data.get("results") or []
+        if not r.get("passed") and r.get("hint")
+    ]
+    return bool(data["passed"]), hints
 
 
 # --- form + state machine ---------------------------------------------------
@@ -283,14 +300,12 @@ def _form(state: dict, hints: list[dict] | None = None) -> tuple[str, dict]:
     by_q = {h["question_id"]: h for h in hints or []}
     props = {}
     for q in state["questions"]:
-        desc = q["text"]
-        if q.get("lines"):
-            desc += f" ({_fmt_lines(q['lines'])})"
+        desc = f"{q['question']} ({_fmt_range(q['line_start'], q['line_end'])})"
         hint = by_q.get(q["id"])
         if hint:
-            desc += f"\nHint: {hint['text']}"
-            if hint.get("lines"):
-                desc += f" ({_fmt_lines(hint['lines'])})"
+            desc += f"\nHint: {hint['hint']}"
+            if hint.get("hint_line") is not None:
+                desc += f" (line {hint['hint_line']})"
         props[q["id"]] = {
             "type": "string",
             "title": f"Question {len(props) + 1}",
