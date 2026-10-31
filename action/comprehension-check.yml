@@ -1,0 +1,33 @@
+name: Comprehension Gate
+
+on:
+  pull_request:
+
+# Needed for checkout and for creating a pull-request comment when review is required.
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  comprehension-check:
+    name: Comprehension Gate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the pull request with full history
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Check for unanswered comprehension questions
+        run: python .github/scripts/check.py
+        env:
+          BACKEND_URL: ${{ secrets.BACKEND_URL }}
+          GATE_SECRET: ${{ secrets.GATE_SECRET }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
