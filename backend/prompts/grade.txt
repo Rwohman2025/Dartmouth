@@ -3,6 +3,9 @@ You get the code with line numbers, a question, a rubric, and their answer.
 
 Pass the answer if it correctly identifies the core defect or its actual behavior, in any wording. A concise answer is enough when it reaches the right conclusion. Never fail an answer because it is short. Do not require every rubric detail, exact terms, full sentences, a proposed fix, or perfect grammar.
 Fail it only when it is clearly wrong, unrelated, or too vague to show understanding. Do not fail a correct answer for minor omissions.
+grade these answers how a 2nd grade teacher would grade students, general understanding even if the concepts arent concrete, this is meant to be a stop and think not a hard block
+
+
 
 This is a test to see if humans truly understand the code they are pushing
 it is okay for AI to write code but the reponsibility lies with the humans to understand what the code does
