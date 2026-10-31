@@ -1,0 +1,6 @@
+Metadata-Version: 2.4
+Name: mcp-gate
+Version: 0.1.1
+Requires-Python: <3.15,>=3.12
+Requires-Dist: fastmcp>=4.1.4
+Requires-Dist: python-dotenv>=1.2.4

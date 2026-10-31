@@ -1,6 +1,6 @@
 # API Contract
 
-Backend URL: https://dartmouth-production.up.railway.app/docs#/
+Backend URL: https://dartmouth-production.up.railway.app/docsg#/
  until deployed, then replace with the live URL.
 
 All requests and responses are JSON.
