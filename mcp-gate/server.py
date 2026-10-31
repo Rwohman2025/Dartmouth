@@ -92,7 +92,8 @@ STOPWORDS = {
 
 REFUSAL = (
     "The user has not shown that they understand this change, so {file} was NOT "
-    "written ({why}). Do not try to write this file another way: no other tool, "
+    "written ({why}). The proposed code is kept at {pending} in {root}. Do not "
+    "try to write this file another way: no other tool, "
     "shell command, or retry of propose_write. Tell the user the write was "
     "blocked and let them decide how to proceed."
 )
@@ -307,11 +308,7 @@ def _sha(content: str) -> str:
 async def _start(file_path: str, content: str, task: str) -> dict:
     root, rel, repo = _locate(file_path)
     _write_file(_pending_path(root, rel), content)
-    try:
-        proposal = await _create_proposal(repo, rel, content, task)
-    except BaseException:
-        _clear_pending(root, rel)
-        raise
+    proposal = await _create_proposal(repo, rel, content, task)
     return {
         "id": proposal["id"],
         "questions": proposal["questions"],
@@ -324,8 +321,12 @@ async def _start(file_path: str, content: str, task: str) -> dict:
 
 
 def _refuse(state: dict, why: str) -> str:
-    _clear_pending(Path(state["root"]), state["rel"])
-    return REFUSAL.format(file=state["rel"], why=why)
+    return REFUSAL.format(
+        file=state["rel"],
+        pending=f"{PENDING_DIR}/{state['rel']}",
+        root=state["root"],
+        why=why,
+    )
 
 
 async def _grade(
