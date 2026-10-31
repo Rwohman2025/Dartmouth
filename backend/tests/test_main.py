@@ -32,7 +32,7 @@ def test_line_numbering_and_invalid_json_retry(monkeypatch):
         return next(responses)
 
     monkeypatch.setattr(main, "_call_anthropic", fake_call)
-    result = main.request_json("grade.txt", "test", main.GradedAnswer)
+    result = main.request_json("grade.txt", "test", main.ModelGradeResponse)
     assert result.passed is True
     assert result.feedback == "Correct."
     assert "output_repair" in content_seen[1]
@@ -54,7 +54,7 @@ def test_grade_response_maps_hint_to_feedback(monkeypatch):
     result = main.grade_answer(
         "x", main.GeneratedQuestion(id="q1", line_start=1, line_end=1, question="Why?", rubric="Explain."), "No idea"
     )
-    assert result == main.GradedAnswer(passed=False, feedback="Check the comparison. See line 0015.")
+    assert result == main.GradedAnswer(passed=False, hint="Check the comparison. See line 0015.", hint_line=15)
 
 
 def test_proposal_lifecycle_uses_model_results_and_hides_rubrics(monkeypatch):
@@ -69,7 +69,7 @@ def test_proposal_lifecycle_uses_model_results_and_hides_rubrics(monkeypatch):
         main,
         "grade_answer",
         lambda _code, _question, answer: main.GradedAnswer(
-            passed=answer == "correct answer", feedback="Model evaluation completed."
+            passed=answer == "correct answer", hint="Model evaluation completed."
         ),
     )
 
@@ -77,30 +77,39 @@ def test_proposal_lifecycle_uses_model_results_and_hides_rubrics(monkeypatch):
     with TestClient(main.app) as client:
         assert client.get("/health", headers=headers).json()["implementation"] == "anthropic"
         created = client.post(
-            "/v1/proposals",
+            "/proposals",
             headers=headers,
             json={
-                "repository": "Rwohman2025/Dartmouth",
-                "commit_sha": "a" * 40,
-                "diff": "first\nsecond",
-                "summary": "Example change",
+                "repo": "Rwohman2025/Dartmouth",
+                "file_path": "src/example.py",
+                "code": "first\nsecond",
+                "task": "Example change",
             },
         )
         assert created.status_code == 201
-        proposal_id = created.json()["proposal_id"]
-        questions = client.get(f"/v1/proposals/{proposal_id}/questions", headers=headers).json()["questions"]
+        created_body = created.json()
+        proposal_id = created_body["proposal_id"]
+        questions = created_body["questions"]
         assert len(questions) == 1
         assert all("rubric" not in question for question in questions)
-        proposal_response = client.get(f"/v1/proposals/{proposal_id}", headers=headers)
+        proposal_response = client.get(f"/proposals/{proposal_id}", headers=headers)
         assert "rubric" not in proposal_response.text
 
         grade = client.post(
-            f"/v1/proposals/{proposal_id}/grade",
+            f"/proposals/{proposal_id}/answers",
             headers=headers,
-            json={"answers": [{"question_id": question["question_id"], "answer": "correct answer"} for question in questions]},
+            json={"answers": [{"question_id": question["id"], "answer": "correct answer"} for question in questions]},
         )
         assert grade.status_code == 200
-        assert grade.json()["status"] == "approved"
+        assert grade.json()["passed"] is True
+        proposal_after_grade = client.get(f"/proposals/{proposal_id}", headers=headers).json()
+        assert proposal_after_grade == {
+            "proposal_id": proposal_id,
+            "repo": "Rwohman2025/Dartmouth",
+            "file_path": "src/example.py",
+            "status": "passed",
+            "attempts": 1,
+        }
         assert client.post("/check", headers=headers, json={"repo": "other/repo", "diff": "diff --git a/a b/a"}).json() == {
             "status": "pass", "unanswered": []
         }
@@ -173,3 +182,53 @@ def test_check_ignores_a_proposal_that_already_passed():
         proposal = seed_proposal("team/passed", "src/example.py", "x = 1\ny = 2", proposal_status="passed")
         result = post_check(client, "team/passed", unified_diff("src/example.py", proposal.diff.splitlines()))
     assert result == {"status": "pass", "unanswered": []}
+
+
+def add_question(proposal: main.Proposal) -> main.Question:
+    question = main.Question(
+        id=str(uuid4()), proposal_id=proposal.id,
+        prompt="What happens when this function receives an empty list?",
+        rubric="The answer must describe the division by zero.",
+        line_start=1,
+        line_end=2,
+    )
+    with main.SessionLocal() as session:
+        session.add(question)
+        session.commit()
+    return question
+
+
+def test_public_review_page_hides_rubric_and_displays_passed_result(monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "grade_answer",
+        lambda _code, _question, _answer: main.GradedAnswer(passed=True, hint="Answer passed review."),
+    )
+    with TestClient(main.app) as client:
+        proposal = seed_proposal("team/review", "src/example.py", "def average(values):\n    return sum(values) / len(values)")
+        question = add_question(proposal)
+        page = client.get(f"/review/{proposal.id}")
+        assert page.status_code == 200
+        assert "src/example.py" in page.text
+        assert "0001" in page.text
+        assert question.prompt in page.text
+        assert question.rubric not in page.text
+
+        submitted = client.post(f"/review/{proposal.id}/answers", data={f"answer_{question.id}": "It divides by zero."})
+    assert submitted.status_code == 200
+    assert "Passed" in submitted.text
+
+
+def test_public_review_page_displays_grading_hint(monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "grade_answer",
+        lambda _code, _question, _answer: main.GradedAnswer(passed=False, hint="Check the division on line 0002."),
+    )
+    with TestClient(main.app) as client:
+        proposal = seed_proposal("team/review-hint", "src/example.py", "def average(values):\n    return sum(values) / len(values)")
+        question = add_question(proposal)
+        submitted = client.post(f"/review/{proposal.id}/answers", data={f"answer_{question.id}": "It is fine."})
+    assert submitted.status_code == 200
+    assert "Review needs another answer" in submitted.text
+    assert "Check the division on line 0002." in submitted.text

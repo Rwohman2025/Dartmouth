@@ -5,16 +5,19 @@ from __future__ import annotations
 import hmac
 import json
 import os
+from html import escape
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Generator, TypeVar
+from typing import Generator, Literal, TypeVar
+from urllib.parse import parse_qs
 from uuid import uuid4
 
 from anthropic import APIError, Anthropic
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from starlette.responses import HTMLResponse
 from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text, create_engine, inspect, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
@@ -68,6 +71,8 @@ class Question(Base):
     proposal_id: Mapped[str] = mapped_column(ForeignKey("proposals.id"), index=True)
     prompt: Mapped[str] = mapped_column(Text)
     rubric: Mapped[str] = mapped_column(Text)
+    line_start: Mapped[int | None] = mapped_column(nullable=True)
+    line_end: Mapped[int | None] = mapped_column(nullable=True)
     proposal: Mapped[Proposal] = relationship(back_populates="questions")
     attempts: Mapped[list["Attempt"]] = relationship(back_populates="question")
 
@@ -81,17 +86,17 @@ class Attempt(Base):
     answer: Mapped[str] = mapped_column(Text)
     passed: Mapped[bool] = mapped_column(Boolean)
     feedback: Mapped[str] = mapped_column(Text)
+    hint_line: Mapped[int | None] = mapped_column(nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     proposal: Mapped[Proposal] = relationship(back_populates="attempts")
     question: Mapped[Question] = relationship(back_populates="attempts")
 
 
 class ProposalInput(BaseModel):
-    repository: str = Field(min_length=1)
-    file_path: str | None = Field(default=None, min_length=1)
-    commit_sha: str = Field(min_length=1)
-    diff: str = Field(min_length=1)
-    summary: str = Field(min_length=1)
+    repo: str = Field(min_length=1)
+    file_path: str = Field(min_length=1)
+    code: str = Field(min_length=1)
+    task: str = Field(min_length=1)
 
 
 class AnswerInput(BaseModel):
@@ -101,6 +106,54 @@ class AnswerInput(BaseModel):
 
 class GradeInput(BaseModel):
     answers: list[AnswerInput] = Field(min_length=1)
+
+
+class QuestionResponse(BaseModel):
+    id: str
+    line_start: int
+    line_end: int
+    question: str
+
+
+class ProposalCreateResponse(BaseModel):
+    proposal_id: str
+    questions: list[QuestionResponse]
+
+
+class AnswerResult(BaseModel):
+    question_id: str
+    passed: bool
+    hint: str
+    hint_line: int | None
+
+
+class AnswerResponse(BaseModel):
+    passed: bool
+    results: list[AnswerResult]
+
+
+class ProposalResponse(BaseModel):
+    proposal_id: str
+    repo: str
+    file_path: str
+    status: Literal["pending", "passed"]
+    attempts: int
+
+
+class CheckInput(BaseModel):
+    repo: str = Field(min_length=1)
+    diff: str = Field(min_length=1)
+
+
+class UnansweredProposal(BaseModel):
+    proposal_id: str
+    file_path: str
+    review_url: str
+
+
+class CheckResponse(BaseModel):
+    status: Literal["pass", "fail"]
+    unanswered: list[UnansweredProposal]
 
 
 class StrictModel(BaseModel):
@@ -121,7 +174,7 @@ class GeneratedQuestion(StrictModel):
 
 
 class GeneratedQuestions(StrictModel):
-    questions: list[GeneratedQuestion] = Field(min_length=1, max_length=3)
+    questions: list[GeneratedQuestion] = Field(min_length=1, max_length=1)
 
 
 class GradingQuestion(StrictModel):
@@ -138,7 +191,8 @@ class ModelGradeResponse(StrictModel):
 
 class GradedAnswer(StrictModel):
     passed: bool
-    feedback: str = Field(min_length=1)
+    hint: str = Field(min_length=1)
+    hint_line: int | None = Field(default=None, ge=1)
 
 
 class ModelConfigurationError(RuntimeError):
@@ -206,12 +260,20 @@ def proposal_match_ratio(proposal_code: str, added_lines: set[str]) -> float:
 
 
 def initialize_database() -> None:
-    """Create fresh tables and add the file-path column to pre-existing databases."""
+    """Create fresh tables and add contract fields to pre-existing databases."""
     Base.metadata.create_all(bind=engine)
-    columns = {column["name"] for column in inspect(engine).get_columns("proposals")}
-    if "file_path" not in columns:
-        with engine.begin() as connection:
+    proposal_columns = {column["name"] for column in inspect(engine).get_columns("proposals")}
+    question_columns = {column["name"] for column in inspect(engine).get_columns("questions")}
+    attempt_columns = {column["name"] for column in inspect(engine).get_columns("attempts")}
+    with engine.begin() as connection:
+        if "file_path" not in proposal_columns:
             connection.execute(text("ALTER TABLE proposals ADD COLUMN file_path VARCHAR(1024)"))
+        if "line_start" not in question_columns:
+            connection.execute(text("ALTER TABLE questions ADD COLUMN line_start INTEGER"))
+        if "line_end" not in question_columns:
+            connection.execute(text("ALTER TABLE questions ADD COLUMN line_end INTEGER"))
+        if "hint_line" not in attempt_columns:
+            connection.execute(text("ALTER TABLE attempts ADD COLUMN hint_line INTEGER"))
 
 
 def load_prompt(name: str) -> str:
@@ -284,12 +346,12 @@ def grade_answer(code: str, question: GeneratedQuestion | GradingQuestion, answe
         ),
         ModelGradeResponse,
     )
-    feedback = result.feedback or result.hint
-    if not feedback:
-        feedback = "Answer passed review." if result.passed else "Answer did not satisfy the grading rubric."
+    hint = result.feedback or result.hint
+    if not hint:
+        hint = "Answer passed review." if result.passed else "Answer did not satisfy the grading rubric."
     if result.hint_line is not None:
-        feedback = f"{feedback} See line {result.hint_line:04d}."
-    return GradedAnswer(passed=result.passed, feedback=feedback)
+        hint = f"{hint} See line {result.hint_line:04d}."
+    return GradedAnswer(passed=result.passed, hint=hint, hint_line=result.hint_line)
 
 
 def get_session() -> Generator[Session, None, None]:
@@ -312,23 +374,29 @@ def get_proposal_or_404(session: Session, proposal_id: str) -> Proposal:
     return proposal
 
 
-def question_payload(question: Question) -> dict[str, str]:
+def question_payload(question: Question) -> QuestionResponse:
     """The client sees the question but never the stored rubric."""
-    return {"question_id": question.id, "prompt": question.prompt}
+    return QuestionResponse(
+        id=question.id,
+        line_start=question.line_start or 1,
+        line_end=question.line_end or question.line_start or 1,
+        question=question.prompt,
+    )
 
 
-def grade_payload(proposal: Proposal, attempts: list[Attempt]) -> dict[str, object] | None:
-    if proposal.graded_at is None:
-        return None
-    return {
-        "proposal_id": proposal.id,
-        "status": proposal.status,
-        "results": [
-            {"question_id": attempt.question_id, "passed": attempt.passed, "feedback": attempt.feedback}
+def answer_payload(attempts: list[Attempt]) -> AnswerResponse:
+    return AnswerResponse(
+        passed=all(attempt.passed for attempt in attempts),
+        results=[
+            AnswerResult(
+                question_id=attempt.question_id,
+                passed=attempt.passed,
+                hint=attempt.feedback,
+                hint_line=attempt.hint_line,
+            )
             for attempt in attempts
         ],
-        "graded_at": proposal.graded_at,
-    }
+    )
 
 
 def model_http_error(error: Exception) -> HTTPException:
@@ -343,50 +411,42 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Dartmouth Gate API", version="1.0.0", lifespan=lifespan, dependencies=[Depends(require_gate_secret)])
+app = FastAPI(title="Dartmouth Gate API", version="1.0.0", lifespan=lifespan)
 
 
-@app.get("/health")
+@app.get("/health", dependencies=[Depends(require_gate_secret)])
 def health() -> dict[str, str]:
     return {"status": "ok", "api_version": "v1", "implementation": "anthropic"}
 
 
-@app.post("/v1/proposals", status_code=status.HTTP_201_CREATED)
-def create_proposal(payload: ProposalInput, session: Session = Depends(get_session)) -> dict[str, object]:
+@app.post("/proposals", status_code=status.HTTP_201_CREATED, response_model=ProposalCreateResponse, dependencies=[Depends(require_gate_secret)])
+def create_proposal(payload: ProposalInput, session: Session = Depends(get_session)) -> ProposalCreateResponse:
     try:
-        generated_questions = generate_questions(payload.diff)
+        generated_questions = generate_questions(payload.code)
     except (ModelConfigurationError, ModelOutputError, ModelRequestError) as error:
         raise model_http_error(error) from error
 
     proposal = Proposal(
-        id=str(uuid4()), repository=payload.repository, file_path=payload.file_path,
-        commit_sha=payload.commit_sha, diff=payload.diff,
-        summary=payload.summary, status="pending", created_at=utc_now(),
+        id=str(uuid4()), repository=payload.repo, file_path=payload.file_path, commit_sha="",
+        diff=payload.code, summary=payload.task, status="pending", created_at=utc_now(),
     )
     session.add(proposal)
-    session.add_all([
-        Question(id=str(uuid4()), proposal_id=proposal.id, prompt=question.prompt, rubric=question.rubric)
+    questions = [
+        Question(
+            id=str(uuid4()), proposal_id=proposal.id, prompt=question.prompt, rubric=question.rubric,
+            line_start=question.line_start, line_end=question.line_end,
+        )
         for question in generated_questions
-    ])
+    ]
+    session.add_all(questions)
     session.commit()
-    return {
-        "proposal_id": proposal.id, "repository": proposal.repository, "commit_sha": proposal.commit_sha,
-        "status": proposal.status, "created_at": proposal.created_at,
-    }
+    return ProposalCreateResponse(proposal_id=proposal.id, questions=[question_payload(question) for question in questions])
 
 
-@app.get("/v1/proposals/{proposal_id}/questions")
-def get_questions(proposal_id: str, session: Session = Depends(get_session)) -> dict[str, object]:
-    get_proposal_or_404(session, proposal_id)
-    questions = list(session.scalars(select(Question).where(Question.proposal_id == proposal_id)))
-    return {"proposal_id": proposal_id, "questions": [question_payload(question) for question in questions]}
-
-
-@app.post("/v1/proposals/{proposal_id}/grade")
-def grade_proposal(proposal_id: str, payload: GradeInput, session: Session = Depends(get_session)) -> dict[str, object]:
+def grade_proposal_result(proposal_id: str, payload: GradeInput, session: Session) -> AnswerResponse:
     proposal = get_proposal_or_404(session, proposal_id)
-    if proposal.graded_at is not None:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Proposal has already been graded.")
+    if proposal.status in {"passed", "approved"}:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Proposal has already passed.")
     questions = list(session.scalars(select(Question).where(Question.proposal_id == proposal_id)))
     question_ids = {question.id for question in questions}
     answers_by_question = {answer.question_id: answer.answer for answer in payload.answers}
@@ -403,7 +463,7 @@ def grade_proposal(proposal_id: str, payload: GradeInput, session: Session = Dep
             )
             attempt = Attempt(
                 id=str(uuid4()), proposal_id=proposal.id, question_id=question.id, answer=answers_by_question[question.id],
-                passed=decision.passed, feedback=decision.feedback, created_at=utc_now(),
+                passed=decision.passed, feedback=decision.hint, hint_line=decision.hint_line, created_at=utc_now(),
             )
             session.add(attempt)
             attempts.append(attempt)
@@ -411,43 +471,32 @@ def grade_proposal(proposal_id: str, payload: GradeInput, session: Session = Dep
         session.rollback()
         raise model_http_error(error) from error
 
-    proposal.status = "approved" if all(attempt.passed for attempt in attempts) else "rejected"
+    proposal.status = "passed" if all(attempt.passed for attempt in attempts) else "pending"
     proposal.graded_at = utc_now()
     session.commit()
-    return grade_payload(proposal, attempts)  # type: ignore[return-value]
+    return answer_payload(attempts)
 
 
-@app.get("/v1/proposals/{proposal_id}/log")
-def get_proposal_log(proposal_id: str, session: Session = Depends(get_session)) -> dict[str, object]:
+@app.post("/proposals/{proposal_id}/answers", response_model=AnswerResponse, dependencies=[Depends(require_gate_secret)])
+def submit_answers(proposal_id: str, payload: GradeInput, session: Session = Depends(get_session)) -> AnswerResponse:
+    return grade_proposal_result(proposal_id, payload, session)
+
+
+@app.get("/proposals/{proposal_id}", response_model=ProposalResponse, dependencies=[Depends(require_gate_secret)])
+def get_proposal(proposal_id: str, session: Session = Depends(get_session)) -> ProposalResponse:
     proposal = get_proposal_or_404(session, proposal_id)
-    events: list[dict[str, object]] = [{
-        "sequence": 1, "type": "proposal.created", "at": proposal.created_at, "data": {"status": "pending"},
-    }]
-    if proposal.graded_at is not None:
-        attempts = list(session.scalars(select(Attempt).where(Attempt.proposal_id == proposal.id)))
-        events.append({"sequence": 2, "type": "proposal.graded", "at": proposal.graded_at, "data": grade_payload(proposal, attempts)})
-    return {"proposal_id": proposal.id, "events": events}
+    attempts = session.scalars(select(Attempt).where(Attempt.proposal_id == proposal.id)).all()
+    return ProposalResponse(
+        proposal_id=proposal.id,
+        repo=proposal.repository,
+        file_path=proposal.file_path or "",
+        status="passed" if proposal.status in {"passed", "approved"} else "pending",
+        attempts=len(attempts),
+    )
 
 
-@app.get("/v1/proposals/{proposal_id}")
-def get_proposal(proposal_id: str, session: Session = Depends(get_session)) -> dict[str, object]:
-    proposal = get_proposal_or_404(session, proposal_id)
-    questions = list(session.scalars(select(Question).where(Question.proposal_id == proposal.id)))
-    attempts = list(session.scalars(select(Attempt).where(Attempt.proposal_id == proposal.id)))
-    return {
-        "proposal_id": proposal.id, "repository": proposal.repository, "commit_sha": proposal.commit_sha,
-        "status": proposal.status, "created_at": proposal.created_at,
-        "questions": [question_payload(question) for question in questions], "grade": grade_payload(proposal, attempts),
-    }
-
-
-class CheckInput(BaseModel):
-    repo: str = Field(min_length=1)
-    diff: str = Field(min_length=1)
-
-
-@app.post("/check")
-def check(payload: CheckInput, session: Session = Depends(get_session)) -> dict[str, object]:
+@app.post("/check", response_model=CheckResponse, dependencies=[Depends(require_gate_secret)])
+def check(payload: CheckInput, session: Session = Depends(get_session)) -> CheckResponse:
     added_by_file = parse_added_lines(payload.diff)
     unanswered: list[dict[str, str]] = []
     backend_url = os.getenv("BACKEND_URL", "http://localhost:8000").rstrip("/")
@@ -457,7 +506,7 @@ def check(payload: CheckInput, session: Session = Depends(get_session)) -> dict[
             select(Proposal).where(
                 Proposal.repository == payload.repo,
                 Proposal.file_path == file_path,
-                Proposal.status != "passed",
+                Proposal.status.not_in(["passed", "approved"]),
             )
         )
         for proposal in proposals:
@@ -470,4 +519,92 @@ def check(payload: CheckInput, session: Session = Depends(get_session)) -> dict[
                     }
                 )
 
-    return {"status": "fail" if unanswered else "pass", "unanswered": unanswered}
+    return CheckResponse(status="fail" if unanswered else "pass", unanswered=unanswered)
+
+
+def render_review_page(
+    proposal: Proposal,
+    questions: list[Question],
+    answers: dict[str, str] | None = None,
+    grade: AnswerResponse | None = None,
+    error_message: str | None = None,
+) -> str:
+    answers = answers or {}
+    code_lines = proposal.diff.splitlines() or [""]
+    code_html = "\n".join(
+        f'<span class="line-number">{line_number:04d}</span><span class="code-line">{escape(line)}</span>'
+        for line_number, line in enumerate(code_lines, start=1)
+    )
+    question_html = "\n".join(
+        "\n".join(
+            [
+                '<section class="question">',
+                f"<h2>Question {index}</h2>",
+                f"<p>{escape(question.prompt)}</p>",
+                f'<label for="answer-{escape(question.id)}">Your answer</label>',
+                f'<textarea id="answer-{escape(question.id)}" name="answer_{escape(question.id)}" required>{escape(answers.get(question.id, ""))}</textarea>',
+                "</section>",
+            ]
+        )
+        for index, question in enumerate(questions, start=1)
+    )
+    result_html = ""
+    if grade is not None:
+        passed = grade.passed
+        rows = []
+        for result in grade.results:
+            outcome = "Passed" if result.passed else escape(result.hint)
+            css_class = "passed" if result.passed else "failed"
+            rows.append(f'<li class="{css_class}">{outcome}</li>')
+        heading = "Passed" if passed else "Review needs another answer"
+        result_html = f'<section class="result"><h2>{heading}</h2><ul>{"".join(rows)}</ul></section>'
+    if error_message:
+        result_html = f'<section class="result failed"><h2>Could not grade answers</h2><p>{escape(error_message)}</p></section>'
+
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Code review · {escape(proposal.file_path or "Proposed file")}</title>
+<style>
+body {{ margin: 0; background: #f7f8fa; color: #202124; font: 16px/1.5 system-ui, sans-serif; }}
+main {{ max-width: 980px; margin: 0 auto; padding: 40px 20px 64px; }}
+h1 {{ margin: 0; font-size: 28px; }} .path {{ color: #52606d; margin: 4px 0 28px; }}
+.code {{ background: #18212b; border-radius: 10px; color: #e7edf3; overflow-x: auto; padding: 16px 0; }}
+.code pre {{ margin: 0; font: 13px/1.55 ui-monospace, Consolas, monospace; }}
+.line-number {{ color: #8b9bab; display: inline-block; padding: 0 16px; text-align: right; user-select: none; width: 4ch; }}
+.code-line {{ white-space: pre; }} .question, .result {{ background: white; border: 1px solid #dfe3e8; border-radius: 10px; margin-top: 20px; padding: 20px; }}
+.question h2, .result h2 {{ font-size: 18px; margin: 0 0 8px; }} label {{ display: block; font-weight: 600; margin-top: 14px; }}
+textarea {{ border: 1px solid #aeb8c2; border-radius: 6px; box-sizing: border-box; font: inherit; min-height: 96px; padding: 10px; resize: vertical; width: 100%; }}
+button {{ background: #1455a3; border: 0; border-radius: 6px; color: white; cursor: pointer; font: inherit; font-weight: 600; margin-top: 20px; padding: 10px 16px; }}
+.passed {{ color: #16713d; }} .failed {{ color: #a33a31; }} .result ul {{ margin: 8px 0 0; padding-left: 20px; }}
+</style></head><body><main>
+<h1>Code understanding review</h1><p class="path">{escape(proposal.file_path or "Proposed file")}</p>
+<section class="code"><pre>{code_html}</pre></section>
+{result_html}
+<form method="post" action="/review/{escape(proposal.id)}/answers">{question_html}<button type="submit">Submit answers</button></form>
+</main></body></html>"""
+
+
+@app.get("/review/{proposal_id}", response_class=HTMLResponse)
+def review_page(proposal_id: str, session: Session = Depends(get_session)) -> HTMLResponse:
+    proposal = get_proposal_or_404(session, proposal_id)
+    questions = list(session.scalars(select(Question).where(Question.proposal_id == proposal.id)))
+    return HTMLResponse(render_review_page(proposal, questions))
+
+
+@app.post("/review/{proposal_id}/answers", response_class=HTMLResponse)
+async def submit_review_answers(proposal_id: str, request: Request, session: Session = Depends(get_session)) -> HTMLResponse:
+    proposal = get_proposal_or_404(session, proposal_id)
+    questions = list(session.scalars(select(Question).where(Question.proposal_id == proposal.id)))
+    form_values = parse_qs((await request.body()).decode("utf-8"), keep_blank_values=True)
+    answers = {question.id: form_values.get(f"answer_{question.id}", [""])[0] for question in questions}
+    if any(not answer.strip() for answer in answers.values()):
+        return HTMLResponse(render_review_page(proposal, questions, answers, error_message="Answer every question before submitting."), status_code=422)
+    try:
+        grade = grade_proposal_result(
+            proposal.id,
+            GradeInput(answers=[AnswerInput(question_id=question.id, answer=answers[question.id]) for question in questions]),
+            session,
+        )
+    except HTTPException as error:
+        return HTMLResponse(render_review_page(proposal, questions, answers, error_message=str(error.detail)), status_code=error.status_code)
+    return HTMLResponse(render_review_page(proposal, questions, answers, grade=grade))

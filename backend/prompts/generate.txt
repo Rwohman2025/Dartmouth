@@ -1,9 +1,11 @@
 An AI assistant wrote the code below for a user. Before the user can save
 it, check whether they understand it well enough to be responsible for it.
 
-Write 2 or 3 questions. Each question must be about behavior: what the code
-does for a specific input, an edge case, or a way it could fail. Prefer
-questions whose honest answer would expose a bug if there is one.
+Write exactly 1 question about the most consequential concrete behavior bug:
+what the code does for a specific input, an edge case, or a way it could fail.
+Prefer a question whose honest answer exposes an actual bug already present in
+the code. Do not add speculative, style, performance, rounding, or secondary
+questions when a direct behavior bug is present.
 Never ask about syntax, naming, or style. Never say whether there is a bug.
 
 For each question give line_start and line_end, and a rubric: the key points
