@@ -38,6 +38,26 @@ def test_line_numbering_and_invalid_json_retry(monkeypatch):
     assert "output_repair" in content_seen[1]
 
 
+def test_request_json_accepts_a_single_markdown_json_fence(monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "_call_anthropic",
+        lambda _system, _content: '```json\n{"passed": true, "hint": "", "hint_line": null}\n```',
+    )
+    result = main.request_json("grade.txt", "test", main.ModelGradeResponse)
+    assert result.passed is True
+    assert result.hint == ""
+
+
+def test_model_http_errors_describe_api_and_json_failures():
+    assert main.model_http_error(main.ModelRequestError()).detail == (
+        "Anthropic could not process the request. Check ANTHROPIC_API_KEY, MODEL, and Railway's deployment logs."
+    )
+    assert main.model_http_error(main.ModelOutputError()).detail == (
+        "The question-generation model did not return the expected JSON after one retry."
+    )
+
+
 def test_generated_question_uses_the_prompt_file_schema():
     result = main.GeneratedQuestions.model_validate_json(
         '{"questions":[{"id":"q1","line_start":2,"line_end":3,"question":"What happens?","rubric":"Explain behavior."}]}'

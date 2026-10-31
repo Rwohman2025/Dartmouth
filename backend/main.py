@@ -285,9 +285,9 @@ def load_prompt(name: str) -> str:
 
 def _call_anthropic(system_prompt: str, user_content: str) -> str:
     api_key = os.getenv("ANTHROPIC_API_KEY")
-    model = os.getenv("MODEL")
-    if not api_key or not model:
-        raise ModelConfigurationError("ANTHROPIC_API_KEY and MODEL must be configured.")
+    model = os.getenv("MODEL", "claude-sonnet-5-5")
+    if not api_key:
+        raise ModelConfigurationError("ANTHROPIC_API_KEY must be configured.")
     try:
         response = Anthropic(api_key=api_key).messages.create(
             model=model,
@@ -303,6 +303,17 @@ def _call_anthropic(system_prompt: str, user_content: str) -> str:
     return text
 
 
+def parse_model_json(raw_output: str, output_type: type[ParsedModel]) -> ParsedModel:
+    """Validate a JSON response, allowing only a single outer Markdown fence."""
+    candidate = raw_output.strip()
+    if candidate.startswith("```"):
+        fence_end = candidate.find("\n")
+        if fence_end == -1 or not candidate.endswith("```"):
+            raise ValueError("Model response has an incomplete Markdown fence.")
+        candidate = candidate[fence_end + 1:-3].strip()
+    return output_type.model_validate_json(candidate)
+
+
 def request_json(prompt_name: str, user_content: str, output_type: type[ParsedModel]) -> ParsedModel:
     """Validate model JSON and make exactly one retry for malformed output."""
     system_prompt = load_prompt(prompt_name)
@@ -316,8 +327,8 @@ def request_json(prompt_name: str, user_content: str, output_type: type[ParsedMo
             retry_content = f"{user_content}\n\n<output_repair>Return JSON only. It must exactly match this schema, including every required key and no extra keys: {json.dumps(output_type.model_json_schema(), separators=(',', ':'))}</output_repair>"
             continue
         try:
-            return output_type.model_validate_json(raw_output)
-        except ValidationError as error:
+            return parse_model_json(raw_output, output_type)
+        except (ValidationError, ValueError) as error:
             if attempt == 1:
                 raise ModelOutputError("Anthropic returned invalid JSON twice.") from error
             retry_content = f"{user_content}\n\n<output_repair>Return JSON only. Your prior JSON was invalid. It must exactly match this schema, including every required key and no extra keys: {json.dumps(output_type.model_json_schema(), separators=(',', ':'))}</output_repair>"
@@ -402,7 +413,15 @@ def answer_payload(attempts: list[Attempt]) -> AnswerResponse:
 def model_http_error(error: Exception) -> HTTPException:
     if isinstance(error, ModelConfigurationError):
         return HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(error))
-    return HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="The grading model returned an invalid response.")
+    if isinstance(error, ModelRequestError):
+        return HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Anthropic could not process the request. Check ANTHROPIC_API_KEY, MODEL, and Railway's deployment logs.",
+        )
+    return HTTPException(
+        status_code=status.HTTP_502_BAD_GATEWAY,
+        detail="The question-generation model did not return the expected JSON after one retry.",
+    )
 
 
 @asynccontextmanager
