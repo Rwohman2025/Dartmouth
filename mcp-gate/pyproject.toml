@@ -1,7 +1,7 @@
 [project]
 name = "mcp-gate"
-version = "0.1.0"
-requires-python = ">=3.12"
+version = "0.1.1"
+requires-python = ">=3.12,<3.15"
 dependencies = [
     "fastmcp>=4.1.4",
     "python-dotenv>=1.2.4",
